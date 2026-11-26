@@ -2,12 +2,12 @@ package com.ahao.upgrader
 
 import android.content.Context
 import android.content.Intent
-import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.util.Log
 import androidx.core.content.FileProvider
 import java.io.File
+import java.io.IOException
 import java.security.MessageDigest
 
 object Utils {
@@ -17,44 +17,21 @@ object Utils {
      */
     fun installApk(context: Context, apkFile: File) {
         try {
-            Log.d(TAG,"准备安装APK: ${apkFile.absolutePath}")
-            Log.d(TAG,"APK文件存在: ${apkFile.exists()}")
-            Log.d(TAG,"APK文件大小: ${apkFile.length()} bytes")
-
-            if (!apkFile.exists()) {
-                Log.e(TAG,"APK文件不存在: ${apkFile.absolutePath}")
-                return
-            }
-
-            if (apkFile.length() == 0L) {
-                Log.e(TAG,"APK文件为空: ${apkFile.absolutePath}")
-                return
-            }
-
-            val intent = Intent(Intent.ACTION_VIEW)
-            intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
-
-            val uri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                val authority = "${context.packageName}${Constants.FILEPROVIDER_AUTHORITY_SUFFIX}"
-                Log.d(TAG,"FileProvider authority: $authority")
-
-                val fileUri = FileProvider.getUriForFile(context, authority, apkFile)
-                Log.d(TAG,"生成的FileProvider URI: $fileUri")
-                fileUri
-            } else {
-                val fileUri = Uri.fromFile(apkFile)
-                Log.d(TAG,"生成的File URI: $fileUri")
-                fileUri
-            }
-
-            intent.setDataAndType(uri, Constants.APK_MIME_TYPE)
-            Log.d(TAG,"启动安装Intent")
-            context.startActivity(intent)
+            require(apkFile.isFile && apkFile.length() > 0L) { "APK 文件不存在或为空" }
+            launchInstaller(context, apkFile)
         } catch (e: Exception) {
-            Log.e(TAG,"安装APK时发生异常", e)
-            e.printStackTrace()
+            Log.e(TAG, "安装 APK 失败", e)
         }
+    }
+
+    internal fun launchInstaller(context: Context, apkFile: File) {
+        val authority = "${context.packageName}${Constants.FILEPROVIDER_AUTHORITY_SUFFIX}"
+        val uri = FileProvider.getUriForFile(context, authority, apkFile)
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            setDataAndType(uri, Constants.APK_MIME_TYPE)
+        }
+        context.startActivity(intent)
     }
 
     /**
@@ -81,60 +58,20 @@ object Utils {
      * 获取应用下载目录 - 根据Android版本选择合适的存储策略
      */
     fun getDownloadDir(context: Context): File {
-        return when {
-            // Android 10+ (API 29+): 使用分区存储，优先使用应用私有外部目录
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q -> {
-                // 使用应用的外部缓存目录，系统安装器可以访问
-                val cacheDir = context.externalCacheDir ?: context.cacheDir
-                File(cacheDir, Constants.DOWNLOADS_DIR_NAME).apply {
-                    if (!exists()) mkdirs()
-                    Log.d(TAG,"Android 10+ 使用缓存目录: $absolutePath")
-                }
-            }
-
-            // Android 7-9 (API 24-28): 尝试使用公共Downloads目录
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.N -> {
-                try {
-                    val publicDownloadsDir =
-                        Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-                    val downloadDir = File(publicDownloadsDir, "MSC")
-
-                    if (publicDownloadsDir != null && publicDownloadsDir.exists()) {
-                        downloadDir.apply {
-                            if (!exists()) mkdirs()
-                            Log.d(TAG,"Android 7-9 使用公共Downloads目录: $absolutePath")
-                        }
-                    } else {
-                        // 回退到应用私有目录
-                        File(
-                            context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS),
-                            Constants.DOWNLOADS_DIR_NAME
-                        ).apply {
-                            if (!exists()) mkdirs()
-                            Log.d(TAG,"回退到应用私有目录: $absolutePath")
-                        }
-                    }
-                } catch (e: Exception) {
-                    // 如果出错，使用应用私有目录
-                    File(
-                        context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS),
-                        Constants.DOWNLOADS_DIR_NAME
-                    ).apply {
-                        if (!exists()) mkdirs()
-                        Log.d(TAG,"异常回退到应用私有目录: $absolutePath")
-                    }
-                }
-            }
-
-            // Android 6及以下: 使用传统外部存储
-            else -> {
-                val downloadDir = File(Environment.getExternalStorageDirectory(), "Download/MSC")
-                downloadDir.apply {
-                    if (!exists()) mkdirs()
-                    Log.d(TAG,"Android 6及以下使用传统外部存储: $absolutePath")
-                }
-            }
+        val internalDownloads = File(context.cacheDir, Constants.DOWNLOADS_DIR_NAME)
+        val preferredDirectories = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            listOfNotNull(context.externalCacheDir?.let { File(it, Constants.DOWNLOADS_DIR_NAME) })
+        } else {
+            listOfNotNull(
+                File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "MSC"),
+                context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+                    ?.let { File(it, Constants.DOWNLOADS_DIR_NAME) },
+            )
         }
+
+        return (preferredDirectories + internalDownloads).firstOrNull { dir ->
+            (dir.isDirectory || dir.mkdirs()) && dir.canWrite()
+        } ?: throw IOException("无法创建 APK 下载目录")
     }
 
     /**

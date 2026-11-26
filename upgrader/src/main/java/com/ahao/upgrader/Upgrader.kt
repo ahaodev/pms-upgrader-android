@@ -1,12 +1,18 @@
 package com.ahao.upgrader
 
 import android.content.Context
-import android.util.Log
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import android.provider.Settings
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import retrofit2.awaitResponse
@@ -20,14 +26,17 @@ class Upgrader private constructor(
     private val project: String,
     private val packageName: String,
 ) {
-    private val TAG = Upgrader::class.java.simpleName
     private val updateApi = Service.createUpdateApi(baseUrl, accessToken)
+    private val serverUrl = baseUrl.toHttpUrl()
     private val okHttpClient = OkHttpClient.Builder()
-        .addInterceptor { chain ->
-            val request = chain.request().newBuilder()
-                .addHeader("x-access-token", accessToken)
-                .build()
-            chain.proceed(request)
+        .addNetworkInterceptor { chain ->
+            val request = chain.request()
+            val url = request.url
+            val sameOrigin = url.scheme == serverUrl.scheme &&
+                url.host == serverUrl.host && url.port == serverUrl.port
+            val builder = request.newBuilder().removeHeader("x-access-token")
+            if (sameOrigin) builder.header("x-access-token", accessToken)
+            chain.proceed(builder.build())
         }
         .build()
 
@@ -52,21 +61,27 @@ class Upgrader private constructor(
             )
 
             val response = updateApi.checkUpdate(request).awaitResponse()
-            if (response.isSuccessful) {
-                val body = response.body()
-                val updateResponse = body?.data
-                if (updateResponse != null) {
-                    if (updateResponse.hasUpdate && !updateResponse.downloadUrl.isNullOrEmpty()) {
-                        _updateState.value = UpdateState.UpdateAvailable(updateResponse)
-                    } else {
-                        _updateState.value = UpdateState.NoUpdateAvailable
-                    }
-                } else {
-                    _updateState.value = UpdateState.Error("更新检查返回空数据")
+            val body = response.body()
+            val update = body?.data
+            _updateState.value = when {
+                !response.isSuccessful -> {
+                    response.errorBody()?.close()
+                    UpdateState.Error("更新检查失败（HTTP ${response.code()}）")
                 }
-            } else {
-                _updateState.value = UpdateState.Error("更新检查失败: ${response.code()}")
+                body == null -> UpdateState.Error("更新检查返回空响应")
+                !body.success() -> UpdateState.Error(
+                    "更新检查失败（${body.code}）" +
+                        (body.msg.takeIf { it.isNotBlank() }?.let { "：$it" } ?: "")
+                )
+                update == null -> UpdateState.Error("更新检查返回空数据")
+                !update.hasUpdate -> UpdateState.NoUpdateAvailable
+                update.downloadUrl.isNullOrBlank() ||
+                    serverUrl.resolve(update.downloadUrl) == null ->
+                    UpdateState.Error("发现新版本，但下载地址缺失或无效")
+                else -> UpdateState.UpdateAvailable(update)
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             _updateState.value = UpdateState.Error("更新检查异常: ${e.message}", e)
         }
@@ -75,66 +90,89 @@ class Upgrader private constructor(
     /**
      * 下载APK文件
      */
-    suspend fun downloadApk(downloadUrl: String, fileName: String = Constants.DEFAULT_APK_FILENAME): String? {
-        Log.d(TAG, downloadUrl)
-        return withContext(Dispatchers.IO) {
-            try {
-                Utils.cleanOldApkFiles(context)
+    suspend fun downloadApk(
+        downloadUrl: String,
+        fileName: String = Constants.DEFAULT_APK_FILENAME,
+    ): String? = downloadApk(downloadUrl, fileName, expectedMd5 = null)
 
-                val downloadDir = Utils.getDownloadDir(context)
-                val apkFile = File(downloadDir, fileName)
+    /** Downloads the APK and checks its MD5 when supplied before emitting DownloadCompleted. */
+    suspend fun downloadApk(
+        downloadUrl: String,
+        fileName: String,
+        expectedMd5: String?,
+    ): String? = withContext(Dispatchers.IO) {
+        var incompleteFile: File? = null
+        try {
+            require(fileName.isNotBlank() && File(fileName).name == fileName &&
+                fileName != "." && fileName != "..") { "APK 文件名无效" }
+            val url = downloadUrl.takeIf { it.isNotBlank() }?.let(serverUrl::resolve)
+            if (url == null) {
+                _updateState.value = UpdateState.Error("下载地址无效")
+                return@withContext null
+            }
 
-                val fullDownloadUrl = baseUrl + downloadUrl
-                Log.d(TAG, "完整下载URL: $fullDownloadUrl")
-
-                val request = Request.Builder()
-                    .url(fullDownloadUrl)
-                    .build()
-
-                val response = okHttpClient.newCall(request).execute()
+            val directory = Utils.getDownloadDir(context)
+            val apkFile = File(directory, fileName)
+            val request = Request.Builder().url(url).build()
+            _updateState.value = UpdateState.Downloading(DownloadProgress(0, -1, -1))
+            okHttpClient.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
                     _updateState.value = UpdateState.Error("下载失败: ${response.code}")
                     return@withContext null
                 }
 
-                val responseBody = response.body
-                if (responseBody == null) {
+                val body = response.body
+                if (body == null) {
                     _updateState.value = UpdateState.Error("下载内容为空")
                     return@withContext null
                 }
 
-                val totalBytes = responseBody.contentLength()
+                val totalBytes = body.contentLength()
                 var downloadedBytes = 0L
-
-                responseBody.byteStream().use { inputStream ->
-                    FileOutputStream(apkFile).use { outputStream ->
+                val tempFile = File.createTempFile("pms-", ".part", directory)
+                incompleteFile = tempFile
+                body.byteStream().use { input ->
+                    FileOutputStream(tempFile).use { output ->
                         val buffer = ByteArray(Constants.BUFFER_SIZE)
                         var bytesRead: Int
-
-                        while (inputStream.read(buffer).also { bytesRead = it } != -1) {
-                            outputStream.write(buffer, 0, bytesRead)
+                        while (input.read(buffer).also { bytesRead = it } != -1) {
+                            ensureActive()
+                            output.write(buffer, 0, bytesRead)
                             downloadedBytes += bytesRead
-
-                            val progress = if (totalBytes > 0) {
+                            val percent = if (totalBytes > 0) {
                                 ((downloadedBytes * 100) / totalBytes).toInt()
                             } else {
                                 -1
                             }
-
                             _updateState.value = UpdateState.Downloading(
-                                DownloadProgress(downloadedBytes, totalBytes, progress)
+                                DownloadProgress(downloadedBytes, totalBytes, percent)
                             )
                         }
                     }
                 }
-
-                Log.d(TAG, "APK下载完成: ${apkFile.absolutePath}")
-                _updateState.value = UpdateState.DownloadCompleted(apkFile.absolutePath)
-                apkFile.absolutePath
-            } catch (e: Exception) {
-                _updateState.value = UpdateState.Error("下载异常: ${e.message}", e)
-                null
             }
+
+            val tempFile = checkNotNull(incompleteFile)
+            if (!verifyApkFile(tempFile.absolutePath, expectedMd5)) {
+                _updateState.value = UpdateState.Error("APK文件校验失败")
+                return@withContext null
+            }
+            ensureActive()
+            if (!tempFile.renameTo(apkFile)) {
+                _updateState.value = UpdateState.Error("无法保存已下载的 APK")
+                return@withContext null
+            }
+            incompleteFile = null
+            val filePath = apkFile.absolutePath
+            _updateState.value = UpdateState.DownloadCompleted(filePath)
+            filePath
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            _updateState.value = UpdateState.Error("下载异常: ${e.message}", e)
+            null
+        } finally {
+            incompleteFile?.delete()
         }
     }
 
@@ -142,10 +180,9 @@ class Upgrader private constructor(
      * 验证下载的APK文件
      */
     fun verifyApkFile(filePath: String, expectedMd5: String?): Boolean {
-        if (expectedMd5.isNullOrEmpty()) return true
-
         val file = File(filePath)
-        if (!file.exists()) return false
+        if (!file.isFile || file.length() == 0L) return false
+        if (expectedMd5.isNullOrBlank()) return true
 
         val actualMd5 = Utils.calculateMD5(file)
         return actualMd5?.equals(expectedMd5, ignoreCase = true) == true
@@ -155,11 +192,38 @@ class Upgrader private constructor(
      * 安装APK
      */
     fun installApk(filePath: String) {
+        when (val result = requestInstall(filePath)) {
+            InstallResult.InstallerOpened -> Unit
+            is InstallResult.PermissionRequired ->
+                _updateState.value = UpdateState.Error("请在系统设置中允许此应用安装未知来源的应用")
+            is InstallResult.Failed ->
+                _updateState.value = UpdateState.Error(result.message, result.throwable)
+        }
+    }
+
+    /** Requests the system installer and returns the next action to the caller. */
+    fun requestInstall(filePath: String): InstallResult {
         val file = File(filePath)
-        if (file.exists()) {
-            Utils.installApk(context, file)
-        } else {
-            _updateState.value = UpdateState.Error("APK文件不存在")
+        if (!file.isFile || file.length() == 0L) {
+            return InstallResult.Failed("APK 文件不存在或为空")
+        }
+
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+                !context.packageManager.canRequestPackageInstalls()
+            ) {
+                InstallResult.PermissionRequired(
+                    Intent(
+                        Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                        Uri.fromParts("package", context.packageName, null),
+                    ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            } else {
+                Utils.launchInstaller(context, file)
+                InstallResult.InstallerOpened
+            }
+        } catch (e: Exception) {
+            InstallResult.Failed("无法打开系统安装器：${e.localizedMessage.orEmpty()}", e)
         }
     }
 
@@ -185,12 +249,7 @@ class Upgrader private constructor(
         }
 
         val fileName = "${packageName}_${updateResponse.latestVersion}_update.apk"
-        val filePath = downloadApk(downloadUrl, fileName) ?: return
-
-        if (!verifyApkFile(filePath, updateResponse.fileHash)) {
-            _updateState.value = UpdateState.Error("APK文件校验失败")
-            return
-        }
+        val filePath = downloadApk(downloadUrl, fileName, updateResponse.fileHash) ?: return
 
         if (autoInstall) {
             installApk(filePath)

@@ -4,16 +4,11 @@ import com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFact
 import kotlinx.serialization.json.Json
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
-import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Retrofit
 
 object Service {
 
     private fun createOkHttpClient(accessToken: String): OkHttpClient {
-        val loggingInterceptor = HttpLoggingInterceptor().apply {
-            level = HttpLoggingInterceptor.Level.BODY
-        }
-
         return OkHttpClient.Builder()
             .addInterceptor { chain ->
                 val request = chain.request().newBuilder()
@@ -21,7 +16,6 @@ object Service {
                     .build()
                 chain.proceed(request)
             }
-            .addInterceptor(loggingInterceptor)
             .connectTimeout(Constants.CONNECTION_TIMEOUT, Constants.TIMEOUT_UNIT)
             .readTimeout(Constants.READ_TIMEOUT, Constants.TIMEOUT_UNIT)
             .writeTimeout(Constants.WRITE_TIMEOUT, Constants.TIMEOUT_UNIT)

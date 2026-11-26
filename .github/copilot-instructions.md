@@ -48,7 +48,7 @@ Upgrader (Builder)          ← public API, constructed with 4 required params
 1. `checkUpdate()` → POST `/access/check` → emits `UpdateState` via `StateFlow`
 2. `downloadApk()` → raw OkHttp download with progress → emits `Downloading` / `DownloadCompleted`
 3. `verifyApkFile()` → optional MD5 check
-4. `installApk()` → FileProvider intent (Android N+) or `Uri.fromFile` (older)
+4. `installApk()` → FileProvider intent (Android 7.0 and newer)
 
 ## Key Conventions
 
@@ -76,7 +76,7 @@ Use `@Serializable` + `@SerialName("snake_case")` on all data classes. The Retro
 `UpdateState`: `Idle`, `Checking`, `UpdateAvailable`, `NoUpdateAvailable`, `Downloading`, `DownloadCompleted`, `Error`. Always handle all branches; the UI in `MainActivity` uses them all.
 
 ### Storage strategy is Android-version-aware
-`Utils.getDownloadDir()` branches on SDK version (Q+, N–P, pre-N). When adding download-related features, maintain this pattern rather than hardcoding a single path.
+`Utils.getDownloadDir()` branches on SDK version (Q+ and N–P). When adding download-related features, maintain this pattern rather than hardcoding a single path.
 
 ### FileProvider authority
 APK installs use `"${context.packageName}.provider"` as the FileProvider authority (defined by `Constants.FILEPROVIDER_AUTHORITY_SUFFIX`). The consuming app must declare a matching `<provider>` in its `AndroidManifest.xml`.

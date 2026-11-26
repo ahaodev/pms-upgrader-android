@@ -7,9 +7,9 @@ PMS 平台配套的 Android 应用内更新库，提供检查更新、下载 APK
 ## 功能特性
 
 - **检查更新**：向 PMS 服务端 POST `/access/check` 查询最新版本
-- **下载 APK**：带实时进度回调，支持断点感知
-- **MD5 校验**：下载完成后自动验证文件完整性
-- **安装 APK**：适配 Android N+（FileProvider）及旧版本
+- **下载 APK**：通过状态流报告实时进度，失败后可重新下载
+- **MD5 校验**：服务端提供 MD5 时，在发布完成状态前校验文件
+- **安装 APK**：通过 FileProvider 支持 Android 7.0 及以上
 - **响应式状态**：通过 `StateFlow` 暴露 `UpdateState`，方便 Compose / LiveData 集成
 
 ---
@@ -56,9 +56,13 @@ implementation("com.github.ahaodev:pmsupgrader:版本号")
 ```xml
 <?xml version="1.0" encoding="utf-8"?>
 <paths>
-    <external-files-path name="downloads" path="downloads/" />
-    <files-path name="downloads" path="downloads/" />
-    <cache-path name="downloads" path="downloads/" />
+    <!-- Android 10+ (API 29+): context.externalCacheDir/downloads/ -->
+    <external-cache-path name="apk_cache_downloads" path="downloads/" />
+    <cache-path name="apk_internal_cache_downloads" path="downloads/" />
+    <!-- Android 7-9 (API 24-28): public Downloads/MSC/ -->
+    <external-path name="apk_public_downloads" path="Download/MSC/" />
+    <!-- Android 7-9 fallback: app external files dir -->
+    <external-files-path name="apk_files_downloads" path="Download/downloads/" />
 </paths>
 ```
 
@@ -82,30 +86,17 @@ val upgrader = Upgrader.Builder(context)
 ### 检查更新
 
 ```kotlin
+// 在页面处于 STARTED 时收集状态，用于渲染界面。
 lifecycleScope.launch {
-    upgrader.checkUpdate(currentVersion = "1.0.0")
-}
-
-// 收集状态
-upgrader.updateState.collect { state ->
-    when (state) {
-        is UpdateState.Idle            -> { /* 初始状态 */ }
-        is UpdateState.Checking        -> { /* 正在检查 */ }
-        is UpdateState.UpdateAvailable -> {
-            val info = state.response
-            // info.latestVersion, info.changelog, info.downloadUrl ...
-        }
-        is UpdateState.NoUpdateAvailable -> { /* 已是最新 */ }
-        is UpdateState.Downloading     -> {
-            val pct = state.progress.progress // 0-100，-1 表示未知
-        }
-        is UpdateState.DownloadCompleted -> {
-            upgrader.installApk(state.filePath)
-        }
-        is UpdateState.Error           -> {
-            // state.message, state.throwable
+    repeatOnLifecycle(Lifecycle.State.STARTED) {
+        upgrader.updateState.collect { state ->
+            renderUpdateState(state)
         }
     }
+}
+
+lifecycleScope.launch {
+    upgrader.checkUpdate(currentVersionCode = "1.0.0")
 }
 ```
 
@@ -122,19 +113,29 @@ lifecycleScope.launch {
 
 ### 手动分步执行
 
+在用户点击“下载”时使用 `UpdateAvailable` 返回的更新信息：
+
 ```kotlin
-// 1. 检查
-upgrader.checkUpdate("1.0.0")
-
-// 2. 下载
-val filePath = upgrader.downloadApk(downloadUrl, "update.apk")
-
-// 3. 校验（可选）
-val ok = upgrader.verifyApkFile(filePath!!, expectedMd5)
-
-// 4. 安装
-if (ok) upgrader.installApk(filePath)
+val downloadUrl = response.downloadUrl ?: return
+val filePath = upgrader.downloadApk(downloadUrl, "update.apk", response.fileHash)
 ```
+
+下载地址支持绝对 HTTP(S) URL 和相对于 `baseUrl` 的路径。访问令牌仅发送给与 `baseUrl` 同源的下载请求。下载失败后可使用同一更新信息重试，进度会从头开始。
+
+在用户点击“安装”时处理系统安装器的启动结果：
+
+```kotlin
+when (val result = upgrader.requestInstall(filePath)) {
+    InstallResult.InstallerOpened -> showMessage("请在系统安装器中确认安装")
+    is InstallResult.PermissionRequired -> {
+        // 用户点击“打开授权设置”时启动该 Intent，返回后可重试安装。
+        showInstallSettingsAction(result.settingsIntent)
+    }
+    is InstallResult.Failed -> showMessage(result.message)
+}
+```
+
+`InstallerOpened` 表示系统安装器已打开。应用完成更新仍需用户在系统界面确认。使用 `performUpdate(autoInstall = true)` 时，由该方法触发安装，状态收集只用于渲染界面。需要处理授权或提供安装重试的界面可以使用手动流程。
 
 ---
 

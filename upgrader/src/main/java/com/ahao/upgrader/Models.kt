@@ -1,5 +1,6 @@
 package com.ahao.upgrader
 
+import android.content.Intent
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
@@ -47,4 +48,9 @@ sealed class UpdateState {
     data class Downloading(val progress: DownloadProgress) : UpdateState()
     data class DownloadCompleted(val filePath: String) : UpdateState()
     data class Error(val message: String, val throwable: Throwable? = null) : UpdateState()
+}
+sealed interface InstallResult {
+    data object InstallerOpened : InstallResult
+    data class PermissionRequired(val settingsIntent: Intent) : InstallResult
+    data class Failed(val message: String, val throwable: Throwable? = null) : InstallResult
 }

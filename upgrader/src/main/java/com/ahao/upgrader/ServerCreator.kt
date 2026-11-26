@@ -4,7 +4,6 @@ import com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFact
 import kotlinx.serialization.json.Json
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
-import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Retrofit
 import java.util.concurrent.TimeUnit
 
@@ -19,19 +18,10 @@ object ServerCreator {
         readTimeout: Long = 60,
         writeTimeout: Long = 60,
     ): OkHttpClient {
-        val logging = HttpLoggingInterceptor()
-        logging.level = HttpLoggingInterceptor.Level.BODY
-
-
-        val trustedHostnames =
-            listOf("localhost","47.92.144.106")
-
         return OkHttpClient.Builder()
-            .hostnameVerifier { hostname, session -> trustedHostnames.containsAll(trustedHostnames) }
             .connectTimeout(connectTimeout, TimeUnit.SECONDS)
             .writeTimeout(writeTimeout, TimeUnit.SECONDS)
             .readTimeout(readTimeout, TimeUnit.SECONDS)
-            .addInterceptor(logging)
             .build()
     }
 
